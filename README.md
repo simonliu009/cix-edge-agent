@@ -4,7 +4,6 @@
 
 **核心技术创新是自行实现/适配 MNN 到 OpenAI Compatible HTTP endpoint 的服务层。** 我们在 MNN CLI 服务端提供本地模型列表和聊天补全接口，支持普通 JSON 回复与 SSE 流式回复，并处理模型 ID、文本内容数组和逐请求 thinking 开关。MNN HTTP 服务监听 127.0.0.1:8001；Pi Agent 通过监听 127.0.0.1:8000 的 Node.js 代理访问它。Node.js 层专门转换 Pi Agent 与 Qwen 的工具调用格式，两层分工明确。
 
-本部署链路不使用 Docker，也不依赖 ROS。ROS 2 机器人节点不属于语音聊天链路。
 
 ## 目录内容
 
