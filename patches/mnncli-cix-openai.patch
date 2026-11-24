@@ -1,0 +1,208 @@
+diff --git a/apps/mnncli/include/mnncli_server.hpp b/apps/mnncli/include/mnncli_server.hpp
+index edd270b93..0a739387c 100644
+--- a/apps/mnncli/include/mnncli_server.hpp
++++ b/apps/mnncli/include/mnncli_server.hpp
+@@ -618,13 +618,15 @@ class MnncliServer {
+ </body>
+ </html>
+     )""";
+-    void Start(MNN::Transformer::Llm* llm, bool is_r1, const std::string& host = "127.0.0.1", int port = 8000);
++    void Start(MNN::Transformer::Llm* llm, bool is_r1, const std::string& host = "127.0.0.1", int port = 8000,
++               const std::string& model_id = "local-model");
+     bool is_r1_{false};
+ private:
+-  void Answer(MNN::Transformer::Llm* llm, const json &messages, std::function<void(const std::string&)> on_result);
++  void Answer(MNN::Transformer::Llm* llm, const json &messages,
++              std::function<void(const std::string&)> on_result, bool thinking = false);
+   void AnswerStreaming(MNN::Transformer::Llm* llm,
+                      const json& messages,
+-                     std::function<void(const std::string&, bool end)> on_partial);
++                     std::function<void(const std::string&, bool end)> on_partial, bool thinking = false);
+     std::mutex llm_mutex_;
+ 
+ };
+diff --git a/apps/mnncli/src/handlers/serve_command_handler.cpp b/apps/mnncli/src/handlers/serve_command_handler.cpp
+index 3cc659dd4..ca076d3ed 100644
+--- a/apps/mnncli/src/handlers/serve_command_handler.cpp
++++ b/apps/mnncli/src/handlers/serve_command_handler.cpp
+@@ -142,7 +142,7 @@ int ServeCommandHandler::Handle(const ParsedCommand& cmd) {
+ 
+     // Start HTTP server (blocking call)
+     MnncliServer server;
+-    server.Start(llm.get(), is_r1, host, port);
++    server.Start(llm.get(), is_r1, host, port, model_name);
+ 
+     return 0;
+ }
+diff --git a/apps/mnncli/src/mnncli_server.cpp b/apps/mnncli/src/mnncli_server.cpp
+index dec010e06..be0aa94c6 100644
+--- a/apps/mnncli/src/mnncli_server.cpp
++++ b/apps/mnncli/src/mnncli_server.cpp
+@@ -26,13 +26,26 @@ bool FromJson(const json& j, PromptItem& item) {
+   if (!j.contains("role") || !j["role"].is_string()) {
+     return false;
+   }
+-  if (!j.contains("content") || !j["content"].is_string()) {
++  if (!j.contains("content")) {
+     return false;
+   }
+ 
+   item.first = j["role"].get<std::string>();   // Role
+-  item.second = j["content"].get<std::string>(); // Content
+-  return true;
++  const auto& content = j["content"];
++  if (content.is_string()) {
++    item.second = content.get<std::string>();
++    return true;
++  }
++  if (content.is_array()) {
++    item.second.clear();
++    for (const auto& part : content) {
++      if (part.is_object() && part.contains("text") && part["text"].is_string()) {
++        item.second += part["text"].get<std::string>();
++      }
++    }
++    return true;
++  }
++  return false;
+ }
+ 
+ std::string trimLeadingWhitespace(const std::string& str) {
+@@ -150,7 +163,8 @@ std::string GetR1UserString(std::string user_content, bool last) {
+     return result_prompts;
+ }
+ 
+-void MnncliServer::Answer(MNN::Transformer::Llm* llm, const json &messages, std::function<void(const std::string&)> on_result) {
++void MnncliServer::Answer(MNN::Transformer::Llm* llm, const json &messages,
++                         std::function<void(const std::string&)> on_result, bool thinking) {
+   std::vector<PromptItem> prompts{};
+   if (messages.is_array()) {
+     for (const auto& item_json : messages) {
+@@ -176,13 +190,15 @@ void MnncliServer::Answer(MNN::Transformer::Llm* llm, const json &messages, std:
+   LlmStreamBuffer stream_buffer{[&processor](const char* str, size_t len){
+     processor.processStream(str, len);
+   }};
+-  std::ostream output_ostream(&stream_buffer);std::lock_guard<std::mutex> lock(llm_mutex_);
++  std::ostream output_ostream(&stream_buffer);
++  std::lock_guard<std::mutex> lock(llm_mutex_);
++  llm->set_config(json{{"jinja", {{"context", {{"enable_thinking", thinking}}}}}}.dump());
+   llm->response(this->is_r1_ ? ConvertToR1(prompts) : prompts, &output_ostream, "<eop>");
+ }
+ 
+ void MnncliServer::AnswerStreaming(MNN::Transformer::Llm* llm,
+                      const json& messages,
+-                     std::function<void(const std::string&, bool end)> on_partial) {
++                     std::function<void(const std::string&, bool end)> on_partial, bool thinking) {
+     std::vector<PromptItem> prompts;
+     if (messages.is_array()) {
+         for (const auto& item_json : messages) {
+@@ -213,6 +229,7 @@ void MnncliServer::AnswerStreaming(MNN::Transformer::Llm* llm,
+     });
+     std::ostream output_ostream(&stream_buffer);
+     std::lock_guard<std::mutex> lock(llm_mutex_);
++    llm->set_config(json{{"jinja", {{"context", {{"enable_thinking", thinking}}}}}}.dump());
+     llm->response(this->is_r1_ ? ConvertToR1(prompts) : prompts, &output_ostream, "<eop>");
+ }
+ 
+@@ -224,8 +241,12 @@ void AllowCors(httplib::Response& res) {
+     res.set_header("Access-Control-Allow-Headers",  "Content-Type, Authorization");
+ }
+ 
+-void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::string& host, int port) {
++void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::string& host, int port,
++                         const std::string& model_id) {
+     this->is_r1_ = is_r1;
++    const auto initial_config = json::parse(llm->dump_config());
++    const bool default_thinking = initial_config.value("jinja", json::object())
++        .value("context", json::object()).value("enable_thinking", false);
+     // Create a server instance
+     httplib::Server server;
+ 
+@@ -248,7 +269,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
+         {"object", "list"},
+         {"data", json::array({
+           {
+-            {"id", "ModelScope/MNN/Qwen2.5-0.5B-Instruct"},
++            {"id", model_id},
+             {"object", "model"},
+             {"created", static_cast<int>(time(nullptr))},
+             {"owned_by", "mnn"}
+@@ -292,8 +313,14 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
+       }
+       json messages = request_json["messages"];
+       LOG_DEBUG("received messages:" + messages.dump(0));
+-      std::string model = request_json.value("model", "undefined-model");
++      std::string model = request_json.value("model", model_id);
+       bool stream = request_json.value("stream", false);
++      if (request_json.contains("enable_thinking") && !request_json["enable_thinking"].is_boolean()) {
++          res.status = 400;
++          res.set_content("{\"error\":\"enable_thinking must be a boolean\"}", "application/json");
++          return;
++      }
++      const bool thinking = request_json.value("enable_thinking", default_thinking);
+       if (!stream) {
+           Answer(llm, messages, [&res, model](const std::string& answer) {
+               json response_json = {
+@@ -324,7 +351,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
+               }
+             };
+             res.set_content(response_json.dump(), "application/json");
+-          });
++          }, thinking);
+           return;
+       }
+       res.set_header("Content-Type", "text/event-stream");
+@@ -332,7 +359,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
+       res.set_header("Connection", "keep-alive");
+       res.set_chunked_content_provider(
+             "text/event-stream",
+-            [llm, messages, model, this](size_t /*offset*/, httplib::DataSink &sink) {
++            [llm, messages, model, thinking, this](size_t /*offset*/, httplib::DataSink &sink) {
+                 auto sse_callback = [&, this](const std::string &partial_text, bool end) {
+                     std::string finish_reason = end ? "stop" : "";
+                     json sse_json = {
+@@ -352,7 +379,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
+                     sink.os.write(chunk_str.c_str(), chunk_str.size());
+                     sink.os.flush();
+                 };
+-                AnswerStreaming(llm, messages, sse_callback);
++                AnswerStreaming(llm, messages, sse_callback, thinking);
+                 std::string done_str = "data: [DONE]\n\n";
+                 sink.os.write(done_str.c_str(), done_str.size());
+                 sink.os.flush();
+@@ -386,7 +413,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
+           return;
+       }
+       json messages = BuildOpenAiMessagesFromAnthropicRequest(request_json);
+-      std::string model = request_json.value("model", "undefined-model");
++      std::string model = request_json.value("model", model_id);
+       bool stream = request_json.value("stream", false);
+ 
+       if (!stream) {
+@@ -410,7 +437,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
+                   }}
+               };
+               res.set_content(response_json.dump(), "application/json");
+-          });
++          }, default_thinking);
+           return;
+       }
+ 
+@@ -420,7 +447,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
+       res.set_header("Connection", "keep-alive");
+       res.set_chunked_content_provider(
+           "text/event-stream",
+-          [llm, messages, model, response_id, this](size_t /*offset*/, httplib::DataSink &sink) {
++          [llm, messages, model, response_id, default_thinking, this](size_t /*offset*/, httplib::DataSink &sink) {
+               SendSseEvent(sink, "message_start", {
+                   {"type", "message_start"},
+                   {"message", {
+@@ -463,7 +490,7 @@ void MnncliServer::Start(MNN::Transformer::Llm* llm, bool is_r1, const std::stri
+                   });
+               };
+ 
+-              AnswerStreaming(llm, messages, anthropic_sse_callback);
++              AnswerStreaming(llm, messages, anthropic_sse_callback, default_thinking);
+ 
+               SendSseEvent(sink, "content_block_stop", {
+                   {"type", "content_block_stop"},
